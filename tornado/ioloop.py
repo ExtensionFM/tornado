@@ -23,6 +23,7 @@ import logging
 import select
 import time
 import traceback
+import sys
 
 from tornado import stack_context
 
@@ -39,6 +40,12 @@ except ImportError:
         from tornado import win32_support as fcntl
     else:
         raise
+
+from zmq import (
+    Poller,
+    POLLIN, POLLOUT, POLLERR,
+    ZMQError, ETERM
+)
 
 class IOLoop(object):
     """A level-triggered I/O loop.
@@ -90,12 +97,16 @@ class IOLoop(object):
 
     # Our events map exactly to the epoll events
     NONE = 0
-    READ = _EPOLLIN
-    WRITE = _EPOLLOUT
-    ERROR = _EPOLLERR | _EPOLLHUP | _EPOLLRDHUP
+    #READ = _EPOLLIN
+    #WRITE = _EPOLLOUT
+    #ERROR = _EPOLLERR | _EPOLLHUP | _EPOLLRDHUP
+    READ = POLLIN
+    WRITE = POLLOUT
+    ERROR = POLLERR
 
     def __init__(self, impl=None):
-        self._impl = impl or _poll()
+        #self._impl = impl or _poll()
+        self._impl = impl or Poller()
         if hasattr(self._impl, 'fileno'):
             self._set_close_exec(self._impl.fileno())
         self._handlers = {}
@@ -210,7 +221,11 @@ class IOLoop(object):
         self._running = True
         while True:
             # Never use an infinite timeout here - it can stall epoll
-            poll_timeout = 0.2
+            #poll_timeout = 0.2
+            # In pyzmq, we need to multiply the timeout by 1000 because
+            # the poll interface in pyzmq that is used here takes the timeout
+            # in ms. The value of 0.2 that exists in tornado is in seconds.
+            poll_timeout = 0.2 * 1000
 
             # Prevent IO event starvation by delaying new callbacks
             # to the next iteration of the event loop.
@@ -231,7 +246,8 @@ class IOLoop(object):
                     self._run_callback(timeout.callback)
                 if self._timeouts:
                     milliseconds = self._timeouts[0].deadline - now
-                    poll_timeout = min(milliseconds, poll_timeout)
+                    #poll_timeout = min(milliseconds, poll_timeout)
+                    poll_timeout = min(1000*milliseconds, poll_timeout)
 
             if not self._running:
                 break
@@ -243,6 +259,15 @@ class IOLoop(object):
 
             try:
                 event_pairs = self._impl.poll(poll_timeout)
+            except ZMQError:
+                e = sys.exc_info()[1]
+                if e.errno == ETERM:
+                    # This happens when the zmq Context is closed; we should just exit.
+                    self._running = False
+                    self._stopped = True
+                    break
+                else:
+                    raise
             except Exception, e:
                 # Depending on python version and IOLoop implementation,
                 # different exception types may be thrown and there are
@@ -415,6 +440,14 @@ class PeriodicCallback(object):
             logging.error("Error in periodic callback", exc_info=True)
         if self._running:
             self.start()
+
+class DelayedCallback(PeriodicCallback):
+    """Schedules the given callback to be called once.
+    The callback is called after the object is created by callback_time milliseconds.
+    """
+    def _run(self):
+        PeriodicCallback._run(self)
+        self.stop()
 
 
 class _EPoll(object):
